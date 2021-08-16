@@ -1,0 +1,219 @@
+---
+title: Desenvolvendo APIs em R com plumber e Docker
+author: Joao Pedro Oliveira
+date: '2021-08-14'
+slug: []
+categories: ["R", "API", "plumber", "Docker"]
+tags: []
+lastmod: '2021-08-14T11:16:38-03:00'
+keywords: []
+description: ''
+comment: no
+toc: no
+autoCollapseToc: no
+postMetaInFooter: no
+hiddenFromHomePage: no
+contentCopyright: no
+reward: no
+mathjax: yes
+mathjaxEnableSingleDollar: yes
+mathjaxEnableAutoNumber: yes
+hideHeaderAndFooter: no
+flowchartDiagrams:
+  enable: no
+  options: ''
+sequenceDiagrams:
+  enable: no
+  options: ''
+---
+
+O ano é 1990, e em algum lugar desse Brasilzão, Maria e sua filha Alice estão assistindo TV. Em determinado momento do telejornal - os então apresentadores - Cid Moreira e Sérgio Chapelin anunciam o novo plano econômico que seria posto em prática pelo governo federal. Com o objetivos de controlar a inflação foi anunciado o Plano Collor, um dia após a posse do Presidente, foi efetuado um congelamento geral das poupanças com valor superior a NCz\$ 50.000. Esse congelamento acabou com as finanças pessoais daquela família, e só depois de anos que eles conseguiram se reerguer...
+
+O ano é 2015, todos os dias Alice executa a mesma rotina: Ela acorda, prepara um café quentinho, passa dois pães dormidos na frigideira, e vai para a faculdade. Na mesma casa, no cômodo ao lado Dona Maria já está de pé, esta pega seu telefone celular e...
+
+<!--more-->
+
+Confere seu saldo no banco. Esse tipo de comportamento é comum, especialmente entre aqueles que experienciaram o confisco das poupanças que foi feito durante o Governo Collor. Essa ordem de acontecimentos é comum, talvez você - leitor - tenha uma rotina semelhante, talvez não. Todavia, o que talvez nem você e nem Dona Maria saibam é a infinidade de pedidos e processamentos que ocorrem no instante em que ela abriu a aplicação do banco.
+
+No Brasil, em que o principal marcador temporal é a presidência de Jair M. Bolsonaro, Alice é desenvolvedora back-end, e trabalha em uma empresa de serviços financeiros. Seu trabalho? Desenvolver a interface que faz a ligação do celular de sua mãe com os servidores da companhia em que trabalha. Entregar de forma rápida, segura e confiável o saldo para outras pessoas como ela e sua mãe, que entram em panico ao ouvir a palavra confisco, ou ao receberem o menor sinal de que seu suado dinheiro pode ter sido tomado.
+
+A forma que essa entrega é feita é por meio de uma API, uma Interface de Programação de Aplicações, que basicamente é um programa de computador que está constantemente em execução. O que a API faz responder a pedidos que são feitos por usuários. Quando Dona Maria abre o aplicativo do banco, o que a API que Alice desenhou faz é processar:
+
+-   Quem está fazendo o pedido?
+
+-   Qual pedido de informação está sendo feito?
+
+-   Esse usuário tem permissão para fazer esse pedido?
+
+Caso as respostas sejam:
+
+-   Dona Maria.
+
+-   Obter o saldo da conta de Dona Maria.
+
+Sim.
+
+É retornado ao celular dela o valor do saldo da conta. Se as respostas não forem estas é retornada uma mensagem de acesso negado - por convenção nós chamamos essa mensagem de status 403.
+
+Como toda pessoa de coração puro, Alice decidiu escrever sua API em R, e para isso, faz uso da `{plumber}`, a principal biblioteca do R para o desenvolvimento desse tipo de interface. Os motivos para usar a `plumber` são muitos, mas o principal é sua simplicidade. Um endpoint é levantado fazendo o uso de comentários especiais, que seguem uma sintaxe parecida com a que usamos para escrever documentações com o {roxygen2}.
+
+Digamos que o objetivo é construir uma simples API que recebe um nome e um ID. A partir disso, o sistema deve consultar uma banco de dados que de usuários procurando aquele nome e ID. Caso não encontre, deve retornar um erro. Todavia, caso encontre devemos retornar um JSON com o saldo daquele usuário. Comecemos construindo uma tabela de `SQLite` com esses dados...
+
+O Inicio
+
+Essa tarefa será executada com auxilio da DBI, que pode ser uma biblioteca que alguns não conhecem, mas ela é a principal forma de conectar em bancos de dados usando R. Ela suporta uma infinidade de tipos de banco do `MS SQL Server`, passando por `MongoDB`, `SQLite` e indo até o `Cassandra`.
+
+```{r}
+library(DBI)
+library(uuid)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(plumber)
+library(randomNames)
+
+# Criando um DB temporário na memória RAM.
+con <- DBI::dbConnect(
+  RSQLite::SQLite(), 
+  ":memory:")
+
+# Tabela dummy com nossos dados
+tbl <- tibble::tibble(
+  names = randomNames::randomNames(
+    n = 10, 
+    name.order = "first.last", 
+    name.sep = " "),
+  id = uuid::UUIDgenerate(n = 10),
+  balance = purrr::rdunif(10, 1, 1000)) %>%
+  dplyr::bind_rows(
+    tibble::tibble(names = "Maria",
+                   id = "123456789t",
+                   balance = 420.69))
+
+```
+
+Perfeito, tudo certo com ele, nossos dados fantasia estão aí, agora vamos envia-los para nosso DB e conferir se o envio das informações foi um sucesso.
+
+Para isso, ainda usando a DBI, usamos a função `DBI::dbWriteTable`, que irá receber 3 argumentos: uma conexão ao DB - que foi estabelecida usando a `DBI::dbConnect` no bloco de código acima -, o nome que você deseja dar a tabela que irá criar, e a tibble que deve ser enviada para o banco.
+
+```{r}
+DBI::dbWriteTable(con, "accounts", tbl)
+```
+
+Essa função não possui retorno, para verificar se a operação foi um sucesso devemos no atentar a erros. Caso nenhum tenha ocorrido tudo parece estar certo. Iremos agora utilizar a combinação de `DBI::dbSendQuery` e `DBI::dbFetch` para verificar se o nosso upload foi um sucesso.
+
+```{r}
+DBI::dbSendQuery(
+  con, 
+  "SELECT * from accounts") %>% 
+  DBI::dbFetch()
+```
+
+Como o retorno da operação foi um sucesso, temos um banco de dados. Passamos agora para a construção da API, e começamos carregando o plumber e fazendo um desenho básico. O usuário irá perceber que essa definição de endpoint é feita por meio de um tipo especial de comentário, que é o sustenido seguido de um asterisco (\#\*). Essa sintaxe é única do plumber e indica que a função seguinte é uma API.
+
+O tipo de endpoint é definido pelos verbos @get, @post, @delete, @patch ou, por fim, @put. Essas tags definem o que o nosso endpoint fará. Como esse não se propõe a ser um tutorial sobre como APIs funcionam, deixo aqui uma pequena explicação sobre o que faz cada tipo de verbo HTTP.
+
+```{r}
+library(plumber)
+
+#* Consulta o Banco
+#*
+#* @param name nome do usuario
+#* @param id id do usuario
+#*
+#* @get /balance
+function(name, id) {
+
+  con %>% 
+    DBI::dbSendQuery(
+      glue::glue("SELECT * 
+                 FROM accounts 
+                 WHERE id = '{id}' 
+                 AND names = '{name}'")) %>%
+    DBI::dbFetch() %>%
+    dplyr::pull(balance)
+}
+```
+
+Agora iremos iniciar um contêiner para podermos deixar nossa API no ar de forma isolada das outras aplicações que estão em execução no nosso computador. Para isso precisamos ter o Docker instalado - mais instruções sobre como fazer isso na documentação do Docker - , tendo isso é só executar o seguinte código no seu terminal:
+
+```{bash eval=FALSE, include=TRUE}
+$ docker pull rstudio/plumber
+```
+
+O que ele fará é conectar aos servidores do Docker e fazer o download da imagem Docker que possui o R e o `Plumber` instalados, isso vai nos ganhar um tempo.
+
+Criaremos então, um arquivo chamado api.R que irá conter todo código que digitamos até agora, ficará assim:
+
+```{r eval=FALSE, include=TRUE}
+install.packages( c("tibble", "dplyr", "randomNames", "purrr", "DBI", "uuid"))
+
+
+library(DBI)
+library(uuid)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(plumber)
+library(randomNames)
+
+# Criando um DB temporário na memória RAM.
+con <- DBI::dbConnect(
+  RSQLite::SQLite(), 
+  ":memory:")
+
+# Tabela dummy com nossos dados
+tbl <- tibble::tibble(
+  names = randomNames::randomNames(
+    n = 10, 
+    name.order = "first.last", 
+    name.sep = " "),
+  id = uuid::UUIDgenerate(n = 10),
+  balance = purrr::rdunif(10, 1, 1000)) %>%
+  dplyr::bind_rows(
+    tibble::tibble(names = "Maria",
+                   id = "123456789t",
+                   balance = 420.69))
+
+DBI::dbWriteTable(con, "accounts", tbl)
+
+
+#---------------
+
+#* Consulta o Banco
+#*
+#* @param name nome do usuario
+#* @param id id do usuario
+#*
+#* @get /balance
+function(name, id) {
+
+  con %>% 
+    DBI::dbSendQuery(
+      glue::glue("SELECT * 
+                 FROM accounts 
+                 WHERE id = '{id}' 
+                 AND names = '{name}'")) %>%
+    DBI::dbFetch() %>%
+    dplyr::pull(balance)
+}
+
+```
+
+E a partir de então iremos iniciar nossa API, para isso precisamos voltar ao terminal e executar o seguinte código, que dirá ao Docker que deve ser inicializado um contêiner usando a imagem `rstudio/plumber` e dentro deste deve ser executada a API que está definida em `api.R`, que lá dentro será renomeada para `plumber.R`.
+
+```{bash eval=FALSE, include=TRUE}
+$ docker run --rm -p 8000:8000 -v `pwd`/api.R:/plumber.R rstudio/plumber /plumber.R
+```
+
+Essa operação de levantar a API pode demorar alguns minutos, isso ocorrerá pois nosso contêiner opera como se fosse um computador separado do nosso, por conta disso, se faz necessário a instalação de todas as bibliotecas.
+
+O importante é que no final dela, poderemos requisitar o saldo de Maria por meio de uma simples consulta HTTP por meio da cURL, um programa de linha de comando usado para esse tipo de requisição.
+
+```{bash eval=FALSE, include=TRUE}
+$ curl -X GET "<http://127.0.0.1:8000/balance?name=Maria&id=123456789t>" -H "accept: */*"
+```
+
+O terminal irá ter como retorno o valor: **`420.69`**, que é o saldo de Maria. Maria continuará tendo medo de um eventual confisco, e não há nada que possamos fazer para resolver isso, mas pelo menos agora sabemos como Alice escreveu uma API.
+
+Vale notar que acessando: <http://127.0.0.1:8000/__docs__/> encontramos uma documentação da sua API e uma forma de fazer uma consulta rápida. A documentação é gerada a partir do comentário escrito na hora de definir o endpoint.
